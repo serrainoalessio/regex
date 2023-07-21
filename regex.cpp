@@ -254,10 +254,12 @@ struct CharacterClassMatcher final : public ASTNode, public Matcher {
     char character() const { return intervals.size()?std::get<0>(intervals[0]):0; }
 };
 
+void optimizeAST(std::unique_ptr<ASTNode>& root);
 struct AST {
     std::unique_ptr<ASTNode> root;
     bool anchorBegin = false;
     bool anchorEnd = false;
+    void optimize() { optimizeAST(this->root); }
 };
 
 using namespace std; 
@@ -470,6 +472,10 @@ inline void _merge_multiply(std::unique_ptr<ASTNode>& root) {
             }();
             wrapper->parent = mult->parent;
             root = std::move(wrapper);  // This frees the mult node
+        } else if (mult->exact() && mult->min == 0) {  // Substitute with an epsilon
+            auto ematch = std::make_unique<EpsilonMatcher>();
+            ematch->parent = mult->parent;
+            root = std::move(ematch);
         }
     }
 }
@@ -557,7 +563,7 @@ void optimizeAST(std::unique_ptr<ASTNode>& root) {
 }
 
 // Returns the root node of an abstract syntax tree
-AST buildAST(std::string_view regex) {
+AST buildAST(std::string_view regex, bool optimize=true) {
     AST ast;
     ast.root = std::make_unique<EpsilonMatcher>();  // Matches the empty string
     ast.root->parent = nullptr;
@@ -827,7 +833,8 @@ AST buildAST(std::string_view regex) {
     if (multiply_environment)
         throw syntax_error("multiply environment not closed");
 
-    optimizeAST(ast.root);
+    if (optimize)
+        optimizeAST(ast.root);
     return ast;
 }
 
@@ -925,10 +932,16 @@ struct NFAState {
     std::set<rtransition_t> rtransitions;  // a pointer to each reverse transition
 };
 
+struct NFA;
+NFA ASTtoNFA(const AST& ast, bool optimize);
 struct NFA {
     std::vector<NFAState> states;
     std::vector<std::unique_ptr<const Matcher>> matchers;
     size_t nGroups = 1;  // Group 0 always exists
+    NFA() = default;
+    NFA(const AST& ast, bool optimize=true): NFA(ASTtoNFA(ast, optimize)) {}
+    NFA(std::string_view regex, bool optimize=true):
+        NFA(buildAST(regex, optimize), optimize) {}
 
     size_t newState() {  // Creates a new state, and returns it
         states.emplace_back(); // return reference to the last node
@@ -1179,7 +1192,7 @@ void _ASTtoNFA(NFA& nfa, size_t begin, size_t end, const std::unique_ptr<ASTNode
     }
 }
 
-NFA ASTtoNFA(const AST& ast) {
+NFA ASTtoNFA(const AST& ast, bool optimize=true) {
     const std::unique_ptr<ASTNode>& root = ast.root;
     NFA nfa;
     size_t begin = nfa.newState(), end = nfa.newState();
@@ -1188,7 +1201,8 @@ NFA ASTtoNFA(const AST& ast) {
     _ASTtoNFA(nfa, begin, end, root, {0}, {0});
     if (!ast.anchorBegin) nfa.addTransition(std::make_unique<UniversalMatcher>(), begin, begin, {}, {});
     if (!ast.anchorEnd) nfa.addTransition(std::make_unique<UniversalMatcher>(), end, end, {}, {});
-    // nfa.optimize();
+    if (optimize)
+        nfa.optimize();
     nfa.check();
     return nfa;
 }
@@ -1462,6 +1476,52 @@ void PrintNFA(const NFA& nfa) {
 
 
 int main() {
+    std::cout << " ==== EMAILS ==== " << std::endl;
+    auto emailmatcher = NFA("<[a-zA-Z0-9._%+\\-]+>@<[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}>");
+    std::vector<std::string_view> emails = {"contact@mywebsite.io", "randomemailaddress",
+                        "john.doe@example.com", "emailaddress123@", "support.team@123-xyz.org",
+                        "mary@some-provider.net", "email@regexexample", "john.doe123@test",
+                        "info@company.co.uk", "@example.com", "hello.world@developers.com",
+                        "jennifer.smith123@gmail.com", "regextest@random", "testemail@regex"};
+    for (auto&&email:emails) {  // For each chandidate email
+        std::cout << "String: " << email << std::endl;
+        auto isemail = emailmatcher.powerset(email);
+        std::cout << "   Is it an email address?   " << ((isemail)?"Yes":"No") << std::endl;
+        if (isemail) {
+            auto captures = emailmatcher.simulate(email);
+            assert(captures.size() == 3);
+            std::cout << "   Username   :              " << captures[1] << std::endl;
+            std::cout << "   Domain name:              " << captures[2] << std::endl;
+        }
+        std::cout << std::endl;
+    }
+
+    std::cout << " ==== URLS ==== " << std::endl;
+    auto urlmatcher = NFA("^<[_a-zA-Z0-9\\-]+>://(<[^@:/]+>(:<[^@:/]+>)?@)?<[^@:/]+\\.[^@:/]+>(:<[0-9]+>)?(/<.*?>(\\?<.*>)?)?$");
+    std::vector<std::string_view> urls = {"http://blog.example.org:8080/archive.html", "http//john.doe@example.org/doc.html",
+        "https.profile.example.com/user.html", "https://www.google.com/search.html?q=keyword", "http://example/page.html",
+        "http://www.example.com/index.html", "ftp://user:password@myserver.net:8080/home.html", "wwwgooglecom/search.html",
+        "https://www.wikipedia.org/about.html", "www.*$@.com/index.html?filter=price", "https://www.facebook.com/profile.html",
+        "blog.examplecom/archive.html", "ftp://files.example.com:2121/document.pdf", "ftp:/myfiles.net:2121/files.html"};
+    for (auto&&url:urls) {  // For each chandidate email
+        std::cout << "String: " << url << std::endl;
+        auto isurl = urlmatcher.powerset(url);
+        std::cout <<     "   Is it an url?   " << ((isurl)?"Yes":"No") << std::endl;
+        if (isurl) {
+            auto captures = urlmatcher.simulate(url);
+            assert(captures.size() == 8);
+            std::cout << "   Protocol:       " << captures[1] << std::endl;
+            std::cout << "   User:           " << captures[2] << std::endl;
+            std::cout << "   Password:       " << captures[3] << std::endl;
+            std::cout << "   Domain name:    " << captures[4] << std::endl;
+            std::cout << "   Port:           " << captures[5] << std::endl;
+            std::cout << "   Path:           " << captures[6] << std::endl;
+            std::cout << "   Query:          " << captures[7] << std::endl;
+        }
+        std::cout << std::endl;
+    }
+
+    // Test 2: check optimizations do not change the functionality
     std::function<std::vector<std::string>(const std::string&)> readFile =
             [&](const std::string& filename) -> std::vector<std::string> {
         std::ifstream inputFile(filename); // Replace "input.txt" with your file name
@@ -1496,6 +1556,7 @@ int main() {
 
     std::cout << std::boolalpha;
     for (auto&&regex:regexes) {
+        // Checks the regex is read and printed correctly (read, print, read, check)
         auto ast = buildAST(regex);
         std::stringstream ss, ss_check;
         ss << ast;
@@ -1504,21 +1565,19 @@ int main() {
         ss_check << ast_check;
         // std::cout << ss_check.str() << std::endl;
         // std::cout << regex << std::endl;
-        assert(ss.str() == ss_check.str());
+        assert(ss.str() == ss_check.str());    
+        // printAST(ast_check);
+        // printAST(ast);
         assert(EqualAST(ast_check, ast));
         // std::cout << "===========" << std::endl;        
         // printAST(ast_check);
         // printAST(ast);
         // std::cout << std::boolalpha << EqualAST(ast_check, ast) << std::endl;
-        auto nfa = ASTtoNFA(ast);
-        // auto nfa2 = nfa;
-        // PrintNFA(nfa);
-        // printAST(ast);
-        // PrintNFA(nfa);
-        auto nfa2 = ASTtoNFA(ast);
-        // std::cout << ast << std::endl;
-        // std::cout << ast.root->accept_epsilon() << std::endl;
-        nfa2.optimize();
+        
+        auto ast2 = buildAST(regex, false);  // Not optimized ast
+        auto nfa = ASTtoNFA(ast2, false);  // Do not optimize the nfa
+        ast2.optimize();  // Removes unnecessary nodes
+        auto nfa2 = ASTtoNFA(ast2);  // Do optimize the nfa
         // PrintNFA(nfa2);
         // PrintNFA(nfa2);
         
